@@ -1,5 +1,4 @@
 use std::{
-    env,
     sync::{
         Arc,
         mpsc::{self},
@@ -16,22 +15,11 @@ mod registry;
 mod storage;
 
 fn main() {
-    let kind = match env::var("STORAGE").as_deref() {
-        Ok("sqlite") => {
-            println!("storage: sqlite (data/actors.db)");
-            storage::StorageKind::Sqlite
-        }
-        _ => {
-            println!("storage: files (data/<id>.json)");
-            storage::StorageKind::File
-        }
-    };
-
     let addr = "127.0.0.1:8080";
     let server = Server::http(addr).expect("could not bind");
     println!("listening on http://{addr}");
 
-    let registry = Arc::new(registry::Registry::new(kind));
+    let registry = Arc::new(registry::Registry::new(storage::StorageKind::File));
 
     for mut request in server.incoming_requests() {
         let reg = Arc::clone(&registry);
