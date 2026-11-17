@@ -11,7 +11,7 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    actor::{Actor, Counter},
+    actor::{Actor, Counter, KBActor},
     storage::{self, StorageKind},
 };
 
@@ -42,6 +42,9 @@ impl Registry {
         let tx = match id.split_once(':') {
             Some(("counter", name)) if !name.is_empty() => {
                 create_actor(id.to_string(), Arc::clone(self), Counter::default())
+            }
+            Some(("kb", name)) if !name.is_empty() => {
+                create_actor(id.to_string(), Arc::clone(self), KBActor::default())
             }
             _ => return Err(format!("unknown actor type in id: {id}")),
         };

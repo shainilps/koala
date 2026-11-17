@@ -1,11 +1,12 @@
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
 };
 
 pub trait Storage {
     fn load(&self) -> io::Result<Option<Vec<u8>>>;
     fn save(&self, bytes: &[u8]) -> io::Result<()>;
+    fn append(&self, bytes: &[u8]) -> io::Result<()>;
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +46,21 @@ impl Storage for FileStorage {
 
     fn save(&self, bytes: &[u8]) -> io::Result<()> {
         let mut file = File::create(&self.tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&self.tmp, &self.path)?;
+        Ok(())
+    }
+
+    fn append(&self, bytes: &[u8]) -> io::Result<()> {
+        match fs::copy(&self.path, &self.tmp) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                File::create(&self.tmp)?;
+            }
+            Err(e) => return Err(e),
+        }
+        let mut file = OpenOptions::new().append(true).open(&self.tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&self.tmp, &self.path)?;
