@@ -1,81 +1,18 @@
 use std::{
-    collections::HashMap,
-    fs::{self, File},
-    io::{self, Write},
+    fs::{self},
     sync::{
-        Arc, Mutex,
-        mpsc::{self, RecvTimeoutError},
+        Arc,
+        mpsc::{self},
     },
     thread,
-    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server};
 
-enum Message {
-    Get(mpsc::Sender<u32>),
-    Inc,
-}
-
-struct Registry {
-    actors: Mutex<HashMap<String, mpsc::Sender<Message>>>,
-}
-
-impl Registry {
-    fn new() -> Self {
-        Registry {
-            actors: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn sender_for(self: &Arc<Self>, id: &str) -> mpsc::Sender<Message> {
-        let mut actors = self.actors.lock().unwrap();
-        if let Some(tx) = actors.get(id) {
-            return tx.clone();
-        } else {
-            let tx = create_actor(id.to_string(), Arc::clone(self));
-            actors.insert(id.to_string(), tx.clone());
-            return tx;
-        }
-    }
-}
-
-fn create_actor(id: String, reg: Arc<Registry>) -> mpsc::Sender<Message> {
-    let (tx, rx) = mpsc::channel::<Message>();
-    println!("starting {id}");
-    thread::spawn(move || {
-        let mut count: u32 = read_file(&id).unwrap();
-        loop {
-            let msg = match rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(msg) => msg,
-                Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    let mut actors = reg.actors.lock().unwrap();
-                    match rx.try_recv() {
-                        Ok(msg) => msg,
-                        Err(_) => {
-                            actors.remove(&id);
-                            println!("sleeping {id}");
-                            break;
-                        }
-                    }
-                }
-            };
-
-            match msg {
-                Message::Inc => {
-                    count = count + 1;
-                    write_file(&id, count).unwrap();
-                }
-                Message::Get(reply) => {
-                    reply.send(count).unwrap();
-                }
-            }
-        }
-    });
-    tx
-}
+mod registry;
+mod storage;
+mod actor;
 
 fn main() {
     fs::create_dir_all("data").unwrap();
@@ -83,7 +20,7 @@ fn main() {
     let server = Server::http(addr).expect("could not bind");
     println!("listening on http://{addr}");
 
-    let registry = Arc::new(Registry::new());
+    let registry = Arc::new(registry::Registry::new());
 
     for mut request in server.incoming_requests() {
         let reg = Arc::clone(&registry);
@@ -105,7 +42,7 @@ fn main() {
     }
 }
 
-fn handle(reg: Arc<Registry>, method: &Method, url: &str, body: &str) -> (u16, String) {
+fn handle(reg: Arc<registry::Registry>, method: &Method, url: &str, body: &str) -> (u16, String) {
     let Some(id) = actor_id_from_path(url) else {
         return (404, error_json("not found; use POST /actors/{id}/call"));
     };
@@ -120,7 +57,7 @@ fn handle(reg: Arc<Registry>, method: &Method, url: &str, body: &str) -> (u16, S
     let actor = reg.sender_for(id);
     match call {
         Call::Inc => {
-            if actor.send(Message::Inc).is_err() {
+            if actor.send(registry::Message::Inc).is_err() {
                 return (500, error_json("actor is gone"));
             }
             match ask_count(&actor) {
@@ -168,33 +105,8 @@ fn actor_id_from_path(url: &str) -> Option<&str> {
     Some(id)
 }
 
-fn ask_count(actor: &mpsc::Sender<Message>) -> Option<u32> {
+fn ask_count(actor: &mpsc::Sender<registry::Message>) -> Option<u32> {
     let (reply_tx, reply_rx) = mpsc::channel();
-    actor.send(Message::Get(reply_tx)).ok()?;
+    actor.send(registry::Message::Get(reply_tx)).ok()?;
     reply_rx.recv().ok()
-}
-
-fn write_file(actor_id: &str, data: u32) -> Result<(), io::Error> {
-    let path = format!("data/{actor_id}.json");
-    let tmp = format!("data/{actor_id}.json.tmp");
-
-    let text = serde_json::to_string(&data)?;
-    let mut file = File::create(&tmp)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
-fn read_file(actor_id: &str) -> Result<u32, io::Error> {
-    let path = format!("data/{actor_id}.json");
-
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let count: u32 = serde_json::from_str(&text)?;
-            Ok(count)
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e),
-    }
 }
