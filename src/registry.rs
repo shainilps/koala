@@ -74,10 +74,7 @@ fn run_actor<A: Actor>(
 ) -> Result<(), String> {
     let storage = storage::open(reg.storage, id).map_err(|e| format!("open storage: {e}"))?;
 
-    let saved = storage.load().map_err(|e| format!("load: {e}"))?;
-    if let Some(bytes) = saved {
-        actor = serde_json::from_slice(&bytes).map_err(|e| format!("bad state: {e}"))?;
-    }
+    actor.wake(&*storage)?;
 
     loop {
         let msg = match rx.recv_timeout(Duration::from_secs(10)) {
@@ -96,10 +93,8 @@ fn run_actor<A: Actor>(
             }
         };
 
-        match actor.handle(&msg.action, msg.args) {
+        match actor.handle(&*storage, &msg.action, msg.args) {
             Ok(value) => {
-                let bytes = serde_json::to_vec(&actor).map_err(|e| format!("serialize: {e}"))?;
-                storage.save(&bytes).map_err(|e| format!("save: {e}"))?;
                 let _ = msg.reply.send(Ok(value));
             }
             Err(e) => {
