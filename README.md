@@ -40,3 +40,9 @@ A vector store: chunks of text with a vector and an optional tag, searched by co
 - `get`: lists every chunk
 
 `put_text` and `search_text` need the server started with `EMBED_URL` and `EMBED_MODEL` (a local Ollama model).
+
+## Example
+
+```
+EMBED_URL=http://127.0.0.1:11434 EMBED_MODEL=all-minilm cargo run
+```
