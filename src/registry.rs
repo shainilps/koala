@@ -1,7 +1,5 @@
 use std::{
     collections::HashMap,
-    fs::{self, File},
-    io::{self, Write},
     sync::{
         Arc, Mutex,
         mpsc::{self, RecvTimeoutError},
@@ -10,91 +8,103 @@ use std::{
     time::Duration,
 };
 
+use serde_json::Value;
+
+use crate::{
+    actor::{Actor, Counter},
+    storage::{self, StorageKind},
+};
+
 pub struct Registry {
     actors: Mutex<HashMap<String, mpsc::Sender<Message>>>,
+    storage: StorageKind,
 }
 
-pub enum Message {
-    Get(mpsc::Sender<u32>),
-    Inc,
+pub struct Message {
+    pub action: String,
+    pub args: Value,
+    pub reply: mpsc::Sender<Result<Value, String>>,
 }
 
 impl Registry {
-    pub fn new() -> Self {
+    pub fn new(storage: StorageKind) -> Self {
         Registry {
             actors: Mutex::new(HashMap::new()),
+            storage,
         }
     }
 
-    pub fn sender_for(self: &Arc<Self>, id: &str) -> mpsc::Sender<Message> {
+    pub fn sender_for(self: &Arc<Self>, id: &str) -> Result<mpsc::Sender<Message>, String> {
         let mut actors = self.actors.lock().unwrap();
         if let Some(tx) = actors.get(id) {
-            return tx.clone();
-        } else {
-            let tx = create_actor(id.to_string(), Arc::clone(self));
-            actors.insert(id.to_string(), tx.clone());
-            return tx;
+            return Ok(tx.clone());
         }
+        let tx = match id.split_once(':') {
+            Some(("counter", name)) if !name.is_empty() => {
+                create_actor(id.to_string(), Arc::clone(self), Counter::default())
+            }
+            _ => return Err(format!("unknown actor type in id: {id}")),
+        };
+        actors.insert(id.to_string(), tx.clone());
+        Ok(tx)
     }
 }
 
-fn create_actor(id: String, reg: Arc<Registry>) -> mpsc::Sender<Message> {
+fn create_actor<A: Actor + Send + 'static>(
+    id: String,
+    reg: Arc<Registry>,
+    actor: A,
+) -> mpsc::Sender<Message> {
     let (tx, rx) = mpsc::channel::<Message>();
     println!("starting {id}");
     thread::spawn(move || {
-        let mut count: u32 = read_file(&id).unwrap();
-        loop {
-            let msg = match rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(msg) => msg,
-                Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    let mut actors = reg.actors.lock().unwrap();
-                    match rx.try_recv() {
-                        Ok(msg) => msg,
-                        Err(_) => {
-                            actors.remove(&id);
-                            println!("sleeping {id}");
-                            break;
-                        }
-                    }
-                }
-            };
-
-            match msg {
-                Message::Inc => {
-                    count = count + 1;
-                    write_file(&id, count).unwrap();
-                }
-                Message::Get(reply) => {
-                    reply.send(count).unwrap();
-                }
-            }
+        if let Err(e) = run_actor(&id, &reg, rx, actor) {
+            println!("{id} stopped: {e}");
+            reg.actors.lock().unwrap().remove(&id);
         }
     });
     tx
 }
 
-fn write_file(actor_id: &str, data: u32) -> Result<(), io::Error> {
-    let path = format!("data/{actor_id}.json");
-    let tmp = format!("data/{actor_id}.json.tmp");
+fn run_actor<A: Actor>(
+    id: &str,
+    reg: &Registry,
+    rx: mpsc::Receiver<Message>,
+    mut actor: A,
+) -> Result<(), String> {
+    let storage = storage::open(reg.storage, id).map_err(|e| format!("open storage: {e}"))?;
 
-    let text = serde_json::to_string(&data)?;
-    let mut file = File::create(&tmp)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
-}
+    let saved = storage.load().map_err(|e| format!("load: {e}"))?;
+    if let Some(bytes) = saved {
+        actor = serde_json::from_slice(&bytes).map_err(|e| format!("bad state: {e}"))?;
+    }
 
-fn read_file(actor_id: &str) -> Result<u32, io::Error> {
-    let path = format!("data/{actor_id}.json");
+    loop {
+        let msg = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {
+                let mut actors = reg.actors.lock().unwrap();
+                match rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        actors.remove(id);
+                        println!("sleeping {id}");
+                        return Ok(());
+                    }
+                }
+            }
+        };
 
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let count: u32 = serde_json::from_str(&text)?;
-            Ok(count)
+        match actor.handle(&msg.action, msg.args) {
+            Ok(value) => {
+                let bytes = serde_json::to_vec(&actor).map_err(|e| format!("serialize: {e}"))?;
+                storage.save(&bytes).map_err(|e| format!("save: {e}"))?;
+                let _ = msg.reply.send(Ok(value));
+            }
+            Err(e) => {
+                let _ = msg.reply.send(Err(e));
+            }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e),
     }
 }

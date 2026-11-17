@@ -1,5 +1,5 @@
 use std::{
-    fs::{self},
+    env,
     sync::{
         Arc,
         mpsc::{self},
@@ -7,20 +7,31 @@ use std::{
     thread,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tiny_http::{Header, Method, Response, Server};
 
+mod actor;
 mod registry;
 mod storage;
-mod actor;
 
 fn main() {
-    fs::create_dir_all("data").unwrap();
+    let kind = match env::var("STORAGE").as_deref() {
+        Ok("sqlite") => {
+            println!("storage: sqlite (data/actors.db)");
+            storage::StorageKind::Sqlite
+        }
+        _ => {
+            println!("storage: files (data/<id>.json)");
+            storage::StorageKind::File
+        }
+    };
+
     let addr = "127.0.0.1:8080";
     let server = Server::http(addr).expect("could not bind");
     println!("listening on http://{addr}");
 
-    let registry = Arc::new(registry::Registry::new());
+    let registry = Arc::new(registry::Registry::new(kind));
 
     for mut request in server.incoming_requests() {
         let reg = Arc::clone(&registry);
@@ -54,47 +65,36 @@ fn handle(reg: Arc<registry::Registry>, method: &Method, url: &str, body: &str) 
         Err(e) => return (400, error_json(&format!("bad body: {e}"))),
     };
 
-    let actor = reg.sender_for(id);
-    match call {
-        Call::Inc => {
-            if actor.send(registry::Message::Inc).is_err() {
-                return (500, error_json("actor is gone"));
-            }
-            match ask_count(&actor) {
-                Some(count) => (200, to_json(&CountReply { count })),
-                None => (500, error_json("actor is gone")),
-            }
-        }
-        Call::Get => match ask_count(&actor) {
-            Some(count) => (200, to_json(&CountReply { count })),
-            None => (500, error_json("actor is gone")),
-        },
+    let actor = match reg.sender_for(id) {
+        Ok(actor) => actor,
+        Err(e) => return (404, error_json(&e)),
+    };
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let msg = registry::Message {
+        action: call.action,
+        args: call.args,
+        reply: reply_tx,
+    };
+    if actor.send(msg).is_err() {
+        return (500, error_json("actor is gone"));
+    }
+    match reply_rx.recv() {
+        Ok(Ok(value)) => (200, value.to_string()),
+        Ok(Err(e)) => (400, error_json(&e)),
+        Err(_) => (500, error_json("actor is gone")),
     }
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "lowercase")]
-enum Call {
-    Inc,
-    Get,
-}
-
-#[derive(Serialize)]
-struct CountReply {
-    count: u32,
-}
-
-#[derive(Serialize)]
-struct ErrorReply<'a> {
-    error: &'a str,
-}
-
-fn to_json<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).expect("reply types always serialize")
+struct Call {
+    action: String,
+    #[serde(default)]
+    args: Value,
 }
 
 fn error_json(msg: &str) -> String {
-    to_json(&ErrorReply { error: msg })
+    json!({ "error": msg }).to_string()
 }
 
 fn actor_id_from_path(url: &str) -> Option<&str> {
@@ -103,10 +103,4 @@ fn actor_id_from_path(url: &str) -> Option<&str> {
         return None;
     }
     Some(id)
-}
-
-fn ask_count(actor: &mpsc::Sender<registry::Message>) -> Option<u32> {
-    let (reply_tx, reply_rx) = mpsc::channel();
-    actor.send(registry::Message::Get(reply_tx)).ok()?;
-    reply_rx.recv().ok()
 }
